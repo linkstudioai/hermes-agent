@@ -521,7 +521,7 @@ class SlackAdapter(BasePlatformAdapter):
     # HTTP webhook mode (Aileron slackrouter integration)
     # ------------------------------------------------------------------
 
-    def _verify_webhook_signature(self, body: bytes, header_sig: str) -> bool:
+    def _verify_webhook_signature(self, body: bytes, sig_header: str) -> bool:
         """Verify X-Webhook-Signature from slackrouter using HERMES_WEBHOOK_SECRET.
 
         slackrouter computes:  sha256=HMAC-SHA256(secret, raw_body)
