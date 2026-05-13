@@ -1,11 +1,35 @@
 """
 Slack platform adapter.
 
-Uses slack-bolt (Python) with Socket Mode for:
-- Receiving messages from channels and DMs
-- Sending responses back
-- Handling slash commands
-- Thread support
+Supports two connection modes:
+
+  Socket Mode (default)
+    Each instance opens a persistent WebSocket to Slack.
+    Requires: SLACK_BOT_TOKEN (xoxb-) + SLACK_APP_TOKEN (xapp-).
+
+  HTTP Webhook Mode
+    An aiohttp server receives forwarded events from the Aileron
+    slackrouter service.  No outbound WebSocket is held open; the
+    instance does not need a publicly routable address because
+    slackrouter sits in front of it inside the VPC.
+
+    Activate by setting SLACK_APP_TOKEN=http-mode in the environment
+    (the value the Aileron provisioner writes for per-employee apps),
+    or by adding  mode: http  under the platforms.slack.extra block
+    in config.yaml.
+
+    Required config.yaml (platforms.slack.extra):
+      mode: http
+      webhookPath: /api/webhooks/slack   # path slackrouter posts to
+      port: 8644                         # port to bind (default 8644)
+      host: 0.0.0.0                      # bind address (default 0.0.0.0)
+
+    Signature verification:
+      slackrouter adds  X-Webhook-Signature: sha256=<hmac>  using the
+      shared HERMES_WEBHOOK_SECRET.  The adapter verifies this header
+      and rejects requests with an invalid or missing signature.
+      Set HERMES_WEBHOOK_SECRET in the environment (same value that
+      was used to configure slackrouter for this instance).
 """
 
 import asyncio
@@ -23,12 +47,19 @@ try:
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_sdk.web.async_client import AsyncWebClient
     import aiohttp
+    from aiohttp import web as aiohttp_web
     SLACK_AVAILABLE = True
 except ImportError:
     SLACK_AVAILABLE = False
     AsyncApp = Any
     AsyncSocketModeHandler = Any
     AsyncWebClient = Any
+    aiohttp_web = Any  # type: ignore[assignment]
+
+_HTTP_MODE_SENTINEL = "http-mode"
+_DEFAULT_HTTP_PORT = 8644
+_DEFAULT_HTTP_HOST = "0.0.0.0"
+_DEFAULT_WEBHOOK_PATH = "/api/webhooks/slack"
 
 import sys
 from pathlib import Path as _Path
@@ -328,6 +359,10 @@ class SlackAdapter(BasePlatformAdapter):
         # Each value: {"response_url": str, "ts": float}
         self._slash_command_contexts: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
+        # HTTP webhook mode state (used when SLACK_APP_TOKEN=http-mode)
+        self._http_runner: Optional[Any] = None  # aiohttp AppRunner
+        self._http_mode: bool = False
+
     def _describe_slack_api_error(self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """Convert Slack API auth/permission failures into actionable user-facing text."""
         if response is None or not hasattr(response, "get"):
@@ -482,8 +517,157 @@ class SlackAdapter(BasePlatformAdapter):
         # Non-fatal — the user saw the initial ack already.
         return SendResult(success=True, message_id=None)
 
+    # ------------------------------------------------------------------
+    # HTTP webhook mode (Aileron slackrouter integration)
+    # ------------------------------------------------------------------
+
+    def _verify_webhook_signature(self, body: bytes, header_sig: str) -> bool:
+        """Verify X-Webhook-Signature from slackrouter using HERMES_WEBHOOK_SECRET.
+
+        slackrouter computes:  sha256=HMAC-SHA256(secret, raw_body)
+        and sets the header  X-Webhook-Signature: sha256=<hex>.
+        """
+        import hashlib
+        import hmac as _hmac
+
+        secret = os.getenv("HERMES_WEBHOOK_SECRET", "")
+        if not secret:
+            logger.warning(
+                "[Slack/HTTP] HERMES_WEBHOOK_SECRET not set — "
+                "accepting request without signature verification"
+            )
+            return True
+
+        expected = "sha256=" + _hmac.new(
+            secret.encode(), body, hashlib.sha256
+        ).hexdigest()
+        return _hmac.compare_digest(expected, sig_header)
+
+    async def _handle_http_webhook(
+        self, request: Any
+    ) -> Any:
+        """aiohttp handler for POST /api/webhooks/slack (or configured path).
+
+        Verifies the X-Webhook-Signature header, then dispatches the Slack
+        event to the normal message pipeline in the background so we can
+        return 200 immediately (slackrouter does not have a strict timeout
+        on the forwarded leg, but returning quickly is good practice).
+        """
+        try:
+            body = await request.read()
+        except Exception as exc:
+            logger.warning("[Slack/HTTP] Failed to read request body: %s", exc)
+            return aiohttp_web.Response(status=400, text="bad request")
+
+        # Signature verification
+        sig_header = request.headers.get("X-Webhook-Signature", "")
+        if not self._verify_webhook_signature(body, sig_header):
+            logger.warning(
+                "[Slack/HTTP] Rejected request: invalid X-Webhook-Signature"
+            )
+            return aiohttp_web.Response(status=401, text="invalid signature")
+
+        # Parse payload
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("[Slack/HTTP] Bad JSON payload: %s", exc)
+            return aiohttp_web.Response(status=400, text="bad json")
+
+        # Slack URL verification challenge (happens during Event Subscriptions setup)
+        if payload.get("type") == "url_verification":
+            challenge = payload.get("challenge", "")
+            logger.info("[Slack/HTTP] Responding to url_verification challenge")
+            return aiohttp_web.Response(
+                status=200,
+                content_type="application/json",
+                text=json.dumps({"challenge": challenge}),
+            )
+
+        # Dispatch the inner event in the background
+        event = payload.get("event", {})
+        if event:
+            asyncio.create_task(self._handle_slack_message(event))
+        else:
+            logger.debug("[Slack/HTTP] Received payload with no 'event' key: type=%s", payload.get("type"))
+
+        return aiohttp_web.Response(status=200, text="ok")
+
+    async def _connect_http_mode(self, bot_token: str) -> bool:
+        """Start an aiohttp server to receive events forwarded by slackrouter.
+
+        The bot token is used only for outbound API calls (sending messages,
+        reactions, auth.test).  There is no outbound WebSocket connection.
+        """
+        host = self.config.extra.get("host", _DEFAULT_HTTP_HOST)
+        port = int(self.config.extra.get("port", _DEFAULT_HTTP_PORT))
+        path = self.config.extra.get("webhookPath", _DEFAULT_WEBHOOK_PATH)
+
+        proxy_url = _resolve_slack_proxy_url()
+
+        lock_acquired = False
+        try:
+            if not self._acquire_platform_lock("slack-http", f"{host}:{port}{path}", "Slack HTTP endpoint"):
+                return False
+            lock_acquired = True
+
+            # Set up AsyncApp for outbound API calls only (no event listener
+            # registration needed — events arrive via HTTP, not bolt handlers).
+            # We still use AsyncApp so we get the full Slack SDK client.
+            self._app = AsyncApp(token=bot_token)
+            _apply_slack_proxy(self._app.client, proxy_url)
+
+            # Authenticate and discover bot user ID
+            client = AsyncWebClient(token=bot_token)
+            _apply_slack_proxy(client, proxy_url)
+            auth_response = await client.auth_test()
+            team_id = auth_response.get("team_id", "")
+            self._bot_user_id = auth_response.get("user_id", "")
+            bot_name = auth_response.get("user", "unknown")
+            team_name = auth_response.get("team", "unknown")
+            self._team_clients[team_id] = client
+            self._team_bot_user_ids[team_id] = self._bot_user_id
+
+            logger.info(
+                "[Slack/HTTP] Authenticated as @%s in workspace %s (team: %s)",
+                bot_name, team_name, team_id,
+            )
+
+            # Build aiohttp app with a single route
+            app = aiohttp_web.Application()
+            app.router.add_post(path, self._handle_http_webhook)
+            app.router.add_get("/health", lambda _r: aiohttp_web.Response(text="ok"))
+
+            self._http_runner = aiohttp_web.AppRunner(app)
+            await self._http_runner.setup()
+            site = aiohttp_web.TCPSite(self._http_runner, host, port)
+            await site.start()
+
+            self._http_mode = True
+            self._running = True
+            logger.info(
+                "[Slack/HTTP] Listening on %s:%d%s",
+                host, port, path,
+            )
+            return True
+
+        except Exception as exc:
+            logger.error(
+                "[Slack/HTTP] Failed to start HTTP server: %s", exc, exc_info=True
+            )
+            return False
+        finally:
+            if lock_acquired and not self._running:
+                self._release_platform_lock()
+
     async def connect(self) -> bool:
-        """Connect to Slack via Socket Mode."""
+        """Connect to Slack via Socket Mode or HTTP webhook mode.
+
+        HTTP mode is selected when SLACK_APP_TOKEN is the sentinel string
+        ``'http-mode'`` or when ``platforms.slack.extra.mode`` is ``'http'``
+        in config.yaml.  In HTTP mode the adapter starts an aiohttp server
+        that receives forwarded events from the Aileron slackrouter.
+        """
         if not SLACK_AVAILABLE:
             logger.error(
                 "[Slack] slack-bolt not installed. Run: pip install slack-bolt",
@@ -492,10 +676,22 @@ class SlackAdapter(BasePlatformAdapter):
 
         raw_token = self.config.token
         app_token = os.getenv("SLACK_APP_TOKEN")
+        cfg_mode = self.config.extra.get("mode", "").lower()
 
         if not raw_token:
             logger.error("[Slack] SLACK_BOT_TOKEN not set")
             return False
+
+        # Determine mode: HTTP if sentinel env var OR explicit config
+        use_http_mode = (
+            app_token == _HTTP_MODE_SENTINEL
+            or cfg_mode == "http"
+        )
+
+        if use_http_mode:
+            return await self._connect_http_mode(raw_token)
+
+        # --- Socket Mode (original path) ---
         if not app_token:
             logger.error("[Slack] SLACK_APP_TOKEN not set")
             return False
@@ -715,7 +911,16 @@ class SlackAdapter(BasePlatformAdapter):
         return None
 
     async def disconnect(self) -> None:
-        """Disconnect from Slack."""
+        """Disconnect from Slack (Socket Mode or HTTP mode)."""
+        if self._http_runner is not None:
+            try:
+                await self._http_runner.cleanup()
+            except Exception as exc:
+                logger.warning("[Slack/HTTP] Error stopping HTTP server: %s", exc)
+            finally:
+                self._http_runner = None
+                self._http_mode = False
+
         if self._handler:
             try:
                 await self._handler.close_async()
