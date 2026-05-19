@@ -1,0 +1,88 @@
+name: Release Fork Tag
+
+# Cuts a release tag on this fork that the aileron AMI build pipeline
+# consumes. Tag form: v<upstream-version>-link.<revision>
+#
+# Example: v0.13.0-link.1 (LinkStudio patch revision 1 on upstream 0.13.0)
+#
+# After running this workflow, push a matching tag on the aileron repo:
+#   git tag ami-hermes-v0.13.0-link.1 && git push --tags
+# That triggers .github/workflows/build-ami-hermes.yml on the aileron side,
+# which pulls THIS tag from this fork and bakes a new Hermes AMI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_version:
+        description: 'Upstream hermes-agent version base (matches pyproject), e.g. 0.13.0'
+        required: true
+        default: '0.13.0'
+      revision:
+        description: 'LinkStudio patch revision number (increments per fork release)'
+        required: true
+        default: '1'
+      ref:
+        description: 'Git ref to tag (branch/SHA). Defaults to feature/slack-http-mode HEAD.'
+        required: false
+        default: 'feature/slack-http-mode'
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Cut fork release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+          fetch-depth: 0
+
+      - name: Compute tag
+        id: tag
+        run: |
+          TAG="v${{ github.event.inputs.upstream_version }}-link.${{ github.event.inputs.revision }}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Tag to create: $TAG"
+
+      - name: Verify tag does not exist
+        run: |
+          if git rev-parse "${{ steps.tag.outputs.tag }}" >/dev/null 2>&1; then
+            echo "ERROR: tag ${{ steps.tag.outputs.tag }} already exists" >&2
+            exit 1
+          fi
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create + push annotated tag
+        run: |
+          SHA=$(git rev-parse HEAD)
+          git tag -a "${{ steps.tag.outputs.tag }}" \
+            -m "LinkStudio fork release ${{ steps.tag.outputs.tag }} at ${SHA}" \
+            "$SHA"
+          git push origin "${{ steps.tag.outputs.tag }}"
+
+      - name: Summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## Fork tag published
+
+          | | |
+          |---|---|
+          | **Tag** | \`${{ steps.tag.outputs.tag }}\` |
+          | **Source ref** | \`${{ github.event.inputs.ref }}\` |
+          | **Commit** | \`$(git rev-parse HEAD)\` |
+
+          ### Next step
+          On the \`linkstudioai/aileron\` repo:
+          \`\`\`
+          git tag ami-hermes-${{ steps.tag.outputs.tag }} && git push --tags
+          \`\`\`
+          That triggers the \`Build Hermes AMI\` workflow which will pull
+          \`${{ steps.tag.outputs.tag }}\` from this fork and bake a new AMI.
+          EOF
