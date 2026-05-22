@@ -548,10 +548,16 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> Any:
         """aiohttp handler for POST /api/webhooks/slack (or configured path).
 
-        Verifies the X-Webhook-Signature header, then dispatches the Slack
-        event to the normal message pipeline in the background so we can
-        return 200 immediately (slackrouter does not have a strict timeout
-        on the forwarded leg, but returning quickly is good practice).
+        Verifies the X-Webhook-Signature header, then dispatches the request
+        based on Content-Type:
+
+        * ``application/json`` — Slack event callback or url_verification.
+          Events are passed to the normal message pipeline in the background
+          so we can ack 200 immediately.
+        * ``application/x-www-form-urlencoded`` — Slack interaction payload
+          (block_actions, view_submission, shortcut, …). Dispatched through
+          Bolt's ``AsyncApp.async_dispatch`` to invoke registered
+          ``@app.action(...)`` handlers.
         """
         try:
             body = await request.read()
@@ -559,7 +565,8 @@ class SlackAdapter(BasePlatformAdapter):
             logger.warning("[Slack/HTTP] Failed to read request body: %s", exc)
             return aiohttp_web.Response(status=400, text="bad request")
 
-        # Signature verification
+        # Signature verification (X-Webhook-Signature is set by slackrouter
+        # for both events and interactions).
         sig_header = request.headers.get("X-Webhook-Signature", "")
         if not self._verify_webhook_signature(body, sig_header):
             logger.warning(
@@ -567,7 +574,14 @@ class SlackAdapter(BasePlatformAdapter):
             )
             return aiohttp_web.Response(status=401, text="invalid signature")
 
-        # Parse payload
+        content_type = (
+            request.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        )
+
+        if content_type == "application/x-www-form-urlencoded":
+            return await self._dispatch_interaction_to_bolt(body, request.headers)
+
+        # Default: treat as a JSON payload (events / url_verification).
         try:
             payload = json.loads(body)
         except (json.JSONDecodeError, ValueError) as exc:
@@ -593,6 +607,92 @@ class SlackAdapter(BasePlatformAdapter):
 
         return aiohttp_web.Response(status=200, text="ok")
 
+    async def _dispatch_interaction_to_bolt(
+        self, body: bytes, headers: Any
+    ) -> Any:
+        """Hand a verified Slack interaction (form-encoded) to Bolt.
+
+        Slack POSTs interactions as ``application/x-www-form-urlencoded``
+        with a single ``payload`` field whose value is URL-encoded JSON.
+        We've already validated the X-Webhook-Signature on the outer body
+        in ``_handle_http_webhook``, so we bypass Bolt's own signing-secret
+        verification and dispatch directly via ``async_dispatch``.
+        """
+        from urllib.parse import parse_qs
+
+        try:
+            raw_body = body.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            logger.warning("[Slack/HTTP] Interaction body not UTF-8: %s", exc)
+            return aiohttp_web.Response(status=400, text="bad form payload")
+
+        # Sanity-check that this looks like a Slack interaction body.
+        form = parse_qs(raw_body)
+        raw_payload = form.get("payload", [""])[0]
+        if not raw_payload:
+            logger.warning("[Slack/HTTP] Form body missing payload field")
+            return aiohttp_web.Response(status=400, text="bad form payload")
+        try:
+            json.loads(raw_payload)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("[Slack/HTTP] Bad interaction payload JSON: %s", exc)
+            return aiohttp_web.Response(status=400, text="bad form payload")
+
+        if self._app is None:
+            logger.warning(
+                "[Slack/HTTP] Bolt app not initialized; cannot dispatch interaction"
+            )
+            return aiohttp_web.Response(status=503, text="not ready")
+
+        try:
+            # AsyncBoltRequest moved between slack-bolt versions; try the
+            # current path first and fall back to the older one.
+            try:
+                from slack_bolt.request.async_request import AsyncBoltRequest
+            except ImportError:  # pragma: no cover - older slack-bolt
+                from slack_bolt.request import AsyncBoltRequest  # type: ignore[no-redef]
+        except ImportError as exc:  # pragma: no cover - slack-bolt not installed
+            logger.error("[Slack/HTTP] AsyncBoltRequest import failed: %s", exc)
+            return aiohttp_web.Response(status=500, text="bolt unavailable")
+
+        # Bolt expects headers as Dict[str, Sequence[str]].
+        bolt_headers = {k: [v] for k, v in headers.items()}
+        bolt_req = AsyncBoltRequest(body=raw_body, headers=bolt_headers, mode="http")
+        bolt_resp = await self._app.async_dispatch(bolt_req)
+
+        # Translate BoltResponse → aiohttp Response. Bolt's headers are
+        # Dict[str, Sequence[str]]; collapse to single values for aiohttp.
+        return aiohttp_web.Response(
+            status=bolt_resp.status,
+            body=bolt_resp.body or "",
+            headers=bolt_resp.first_headers_without_set_cookie(),
+        )
+
+    def _register_interactivity_handlers(self) -> None:
+        """Register Block Kit action handlers on the Bolt app.
+
+        Called from both Socket Mode and HTTP mode. Without this, interactions
+        dispatched into Bolt land in the default unhandled handler and the
+        approve/deny/confirm flows never run.
+        """
+        if self._app is None:
+            return
+
+        for _action_id in (
+            "hermes_approve_once",
+            "hermes_approve_session",
+            "hermes_approve_always",
+            "hermes_deny",
+        ):
+            self._app.action(_action_id)(self._handle_approval_action)
+
+        for _action_id in (
+            "hermes_confirm_once",
+            "hermes_confirm_always",
+            "hermes_confirm_cancel",
+        ):
+            self._app.action(_action_id)(self._handle_slash_confirm_action)
+
     async def _connect_http_mode(self, bot_token: str) -> bool:
         """Start an aiohttp server to receive events forwarded by slackrouter.
 
@@ -611,11 +711,26 @@ class SlackAdapter(BasePlatformAdapter):
                 return False
             lock_acquired = True
 
-            # Set up AsyncApp for outbound API calls only (no event listener
-            # registration needed — events arrive via HTTP, not bolt handlers).
-            # We still use AsyncApp so we get the full Slack SDK client.
-            self._app = AsyncApp(token=bot_token)
+            # Set up AsyncApp for outbound API calls AND for dispatching
+            # incoming Slack interactions (block_actions, view_submission,
+            # …). Events still go through the message pipeline directly,
+            # but interactions are forwarded into Bolt so registered
+            # @app.action(...) handlers fire.
+            #
+            # ``request_verification_enabled=False`` is intentional: in HTTP
+            # mode we sit behind Aileron's slackrouter, which has already
+            # validated the Slack signature on the original request and
+            # signs the forwarded body itself with HERMES_WEBHOOK_SECRET
+            # (verified by ``_verify_webhook_signature`` before dispatch).
+            # Slack's own signing secret is not even available on the
+            # instance, so we cannot — and must not — re-verify here.
+            self._app = AsyncApp(
+                token=bot_token,
+                signing_secret="",
+                request_verification_enabled=False,
+            )
             _apply_slack_proxy(self._app.client, proxy_url)
+            self._register_interactivity_handlers()
 
             # Authenticate and discover bot user ID
             client = AsyncWebClient(token=bot_token)
@@ -838,23 +953,7 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 await self._handle_slash_command(command)
 
-            # Register Block Kit action handlers for approval buttons
-            for _action_id in (
-                "hermes_approve_once",
-                "hermes_approve_session",
-                "hermes_approve_always",
-                "hermes_deny",
-            ):
-                self._app.action(_action_id)(self._handle_approval_action)
-
-            # Register Block Kit action handlers for slash-confirm buttons
-            # (generic three-option prompts; see tools/slash_confirm.py).
-            for _action_id in (
-                "hermes_confirm_once",
-                "hermes_confirm_always",
-                "hermes_confirm_cancel",
-            ):
-                self._app.action(_action_id)(self._handle_slash_confirm_action)
+            self._register_interactivity_handlers()
 
             # Start Socket Mode handler in background
             self._handler = AsyncSocketModeHandler(self._app, app_token, proxy=proxy_url)
